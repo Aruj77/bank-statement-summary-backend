@@ -14,30 +14,41 @@ from parsers.pnb_parser import parse_pnb_transactions, extract_pnb_account_numbe
 app = Flask(__name__)
 CORS(app)
 
-def detect_bank_from_text(all_lines, requested_bank="", transaction_start_index=None):
+def detect_bank_from_text(edge_samples, requested_bank=""):
     if requested_bank in ["icici", "hdfc", "axis", "ippb", "sbi", "indusind", "kotak", "pnb"]:
         return "ippb_sbi" if requested_bank in ["ippb", "sbi"] else requested_bank
 
-    if transaction_start_index is None:
-        transaction_start_index = len(all_lines)
+    combined_text = " ".join(edge_samples).lower()
+    print(combined_text)
 
-    # Only look at text appearing BEFORE transactions start to avoid picking up bank names in transaction descriptions/remarks
-    header_lines = all_lines[:transaction_start_index]
-    combined_text = " ".join(header_lines).lower()
-
-    if "icici bank" in combined_text or "icici" in combined_text:
-        return "icici"
-    elif "hdfc bank" in combined_text or "hdfc" in combined_text:
-        return "hdfc"
-    elif "axis bank" in combined_text or "axis" in combined_text or "utib" in combined_text:
+    # Prioritize specific statement signatures to avoid cross-contamination from transaction rows
+    if "statement of axis account" in combined_text or "utib00" in combined_text or "axis bank ltd" in combined_text:
         return "axis"
+    elif "indusind bank" in combined_text or "indb" in combined_text or "indus delite" in combined_text or "reachus@indusind.com" in combined_text:
+        return "indusind"
+    elif "hdfc bank" in combined_text:
+        return "hdfc"
+    elif "icici bank" in combined_text:
+        return "icici"
     elif "ippb/sbi" in combined_text or "india post payments bank" in combined_text or "state bank of india" in combined_text:
         return "ippb_sbi"
-    elif "indusind bank" in combined_text or "indusind" in combined_text:
-        return "indusind"
-    elif "kotak bank" in combined_text or "kotak" in combined_text:
+    elif "kotak bank" in combined_text or "kotak mahindra" in combined_text:
         return "kotak"
-    elif "pnb bank" in combined_text or "punb" in combined_text or "pnb" in combined_text:
+    elif "pnb bank" in combined_text or "punb" in combined_text or "punjab national bank" in combined_text:
+        return "pnb"
+    
+    # Fallback checks if explicit names aren't matched
+    if "axis" in combined_text:
+        return "axis"
+    elif "indusind" in combined_text or "indus" in combined_text:
+        return "indusind"
+    elif "icici" in combined_text:
+        return "icici"
+    elif "hdfc" in combined_text:
+        return "hdfc"
+    elif "kotak" in combined_text:
+        return "kotak"
+    elif "pnb" in combined_text:
         return "pnb"
 
     return None
@@ -53,26 +64,38 @@ def parse_pdf_endpoint():
         password = request.form.get('password', '')
         
         lines = []
+        edge_sample = []
+        bank_type = None
         
         with pdfplumber.open(file, password=password) as pdf:
-            for page in pdf.pages:
+            total_pages = len(pdf.pages)
+            for idx, page in enumerate(pdf.pages):
                 text = page.extract_text()
                 if text:
                     page_lines = text.split('\n')
                     lines.extend(page_lines)
-            
+                    
+                    # Check first page (only first 30 lines) or last page for bank detection
+                    if idx == 0:
+                        first_page_lines = [l.strip() for l in page_lines if l.strip()][:30]
+                        edge_sample.extend(first_page_lines)
+                    elif idx == total_pages - 1:
+                        last_page_lines = [l.strip() for l in page_lines if l.strip()]
+                        edge_sample.extend(last_page_lines)
+                    
+                    # Try detecting bank early if we have enough sample and break loop if found
+                    if idx == 0 or idx == total_pages - 1:
+                        bank_type = detect_bank_from_text(edge_sample, requested_bank)
+                        if bank_type and not requested_bank:
+                            pass
+
         clean_lines = [l.strip() for l in lines if l.strip()]
         
-        # Determine where transactions begin to ignore bank names inside transaction rows/descriptions
-        transaction_start_idx = len(clean_lines)
-        for idx, line in enumerate(clean_lines):
-            lower_line = line.lower()
-            if any(k in lower_line for k in ["opening balance", "tran date", "transaction date", "particulars", "chq no"]):
-                transaction_start_idx = idx
-                break
-
-        bank_type = detect_bank_from_text(clean_lines, requested_bank, transaction_start_idx)
-        print(bank_type)
+        # Final fallback check for bank type if not already caught
+        if not bank_type:
+            bank_type = detect_bank_from_text(edge_sample, requested_bank)
+            
+        print(f"Detected Bank: {bank_type}")
         
         account_number = "Unknown"
         account_holder = "Unknown"
@@ -126,4 +149,4 @@ def parse_pdf_endpoint():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == "__main__":
-    app.run()
+    app.run(port=5000, debug=True)
