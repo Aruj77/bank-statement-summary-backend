@@ -1,0 +1,167 @@
+import io
+import json
+import logging
+from decimal import Decimal
+from typing import Tuple, List, Dict, Any
+
+import pdfplumber
+
+from core.bank_detector import detect_bank_and_metadata
+from core.sample_builder import build_ai_table_sample
+from core.ai_classifier import classify_table_layout_with_llm
+from core.validator import validate_and_score_transactions, ValidationResult
+from core.safe_llm_fallback import parse_with_chunked_llm_fallback
+from parsers import PARSER_REGISTRY
+
+logger = logging.getLogger("BankStatementEngine")
+
+
+class DecimalEncoder(json.JSONEncoder):
+    """Helper to cleanly serialize Decimal objects in debug logs."""
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return str(obj)
+        return super().default(obj)
+
+
+def extract_pdf_contents(file_bytes: bytes, password: str = None) -> Tuple[List[str], List[str], int]:
+    pages_text = []
+    pages_layout = []
+    
+    with pdfplumber.open(io.BytesIO(file_bytes), password=password) as pdf:
+        total_pages = len(pdf.pages)
+        logger.info(f"=== [RAW DATA] Starting extraction for {total_pages} pages ===")
+        
+        for idx, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            layout_text = page.extract_text(layout=True) or ""
+            
+            pages_text.append(text)
+            pages_layout.append(layout_text)
+            
+            logger.debug(
+                f"\n--- [RAW PDF TEXT - PAGE {idx + 1}/{total_pages}] ---\n"
+                f"{text}\n"
+                f"--- [RAW LAYOUT TEXT - PAGE {idx + 1}/{total_pages}] ---\n"
+                f"{layout_text}\n"
+                f"{'-' * 50}"
+            )
+            
+    return pages_text, pages_layout, total_pages
+
+
+def process_bank_statement(
+    file_bytes: bytes, password: str = None, openai_client=None
+) -> Dict[str, Any]:
+    # 1. PDF Text & Layout Extraction
+    pages_text, pages_layout, total_pages = extract_pdf_contents(file_bytes, password)
+    logger.info(f"[PDF] Loaded {total_pages} pages successfully")
+
+    # 2. Bank Detection & Account Metadata Extraction
+    meta = detect_bank_and_metadata(pages_text)
+    logger.info(
+        f"[Bank Detection] Detected: {meta.get('bank', 'Detected Bank')} | "
+        f"A/C: {meta.get('accountNumber', 'N/A')} | "
+        f"Holder: {meta.get('accountHolder', 'Account Holder')} | "
+        f"Type: {meta.get('accountType', 'Savings Account')} | "
+        f"Opening Bal: {meta.get('openingBalance')} | Closing Bal: {meta.get('closingBalance')}"
+    )
+
+    # 3. Build Minimal Masked Table Sample
+    sample_text, is_layout = build_ai_table_sample(pages_text, pages_layout)
+    logger.info(
+        f"\n==================== [RAW AI SAMPLE DATA] (is_layout={is_layout}) ====================\n"
+        f"{sample_text}\n"
+        f"===================================================================================="
+    )
+
+    # 4. Token-Efficient AI Layout Classification
+    detection = classify_table_layout_with_llm(sample_text, openai_client)
+    logger.info(
+        f"[AI Classifier] Selected: {detection.parser} (Confidence: {detection.confidence}) | "
+        f"Method: {detection.debit_credit_method} | Multiline: {detection.multiline_transactions}"
+    )
+
+    # 5. Candidate Ranking Loop
+    candidate_queue = [detection.parser] + [
+        pid for pid in PARSER_REGISTRY.keys() if pid != detection.parser
+    ]
+
+    best_result = None
+    highest_score = -1.0
+
+    for parser_id in candidate_queue:
+        if parser_id not in PARSER_REGISTRY:
+            continue
+
+        parser_entry = PARSER_REGISTRY[parser_id]
+        logger.info(f"[Parser Engine] Executing {parser_id} on {total_pages} pages...")
+
+        try:
+            raw_txns = parser_entry["fn"](pages_text, pages_layout, meta)
+            
+            # Log sample raw parsed transactions
+            formatted_txns = json.dumps(raw_txns[:5], indent=2, cls=DecimalEncoder)
+            logger.info(
+                f"\n--- [RAW PARSED SAMPLE - FIRST {min(5, len(raw_txns))} of {len(raw_txns)} ROWS via {parser_id}] ---\n"
+                f"{formatted_txns}\n"
+                f"{'-' * 60}"
+            )
+
+            val_result = validate_and_score_transactions(
+                raw_txns, meta.get("openingBalance"), meta.get("closingBalance")
+            )
+
+            logger.info(
+                f"[Validation] {parser_id} -> Count: {len(raw_txns)}, Score: {val_result.score}, "
+                f"Reconciliation: {'PASSED' if val_result.details.get('reconciliationVerified') else 'FAILED'} | "
+                f"Audit Diff: {val_result.details.get('auditDifference')}"
+            )
+
+            if val_result.score > highest_score:
+                highest_score = val_result.score
+                best_result = (parser_id, raw_txns, val_result)
+
+            if val_result.is_valid and val_result.score >= 0.85:
+                logger.info(f"[SUCCESS] {parser_id} passed validation threshold.")
+                break
+        except Exception as e:
+            logger.warning(f"[Parser Engine] {parser_id} failed with error: {e}", exc_info=True)
+
+    # 6. Safe LLM Fallback (only triggered if deterministic parsers fail)
+    if not best_result or not best_result[2].is_valid:
+        logger.warning("[FALLBACK] Deterministic parsers failed validation. Invoking LLM Page Fallback.")
+        fallback_txns = parse_with_chunked_llm_fallback(pages_text, openai_client)
+        val_result = validate_and_score_transactions(fallback_txns)
+        best_result = ("AI_FALLBACK_PARSER", fallback_txns, val_result)
+
+    final_parser_id, final_txns, final_val = best_result
+
+    # Construct the unified response payload required by the frontend
+    response_payload = {
+        "status": "success",
+        "bank": meta.get("bank", "Detected Bank"),
+        "accountNumber": meta.get("accountNumber", "N/A"),
+        "accountHolder": meta.get("accountHolder", "Account Holder"),
+        "accountType": meta.get("accountType", "Savings / Current"),
+        "parser": final_parser_id,
+        "parserConfidence": (
+            detection.confidence
+            if final_parser_id == detection.parser
+            else final_val.score
+        ),
+        "summary": final_val.details,
+        "transactions": final_txns,
+    }
+
+    logger.info(
+        f"\n==================== [FINAL OUTPUT SUMMARY] ====================\n"
+        f"Status: {response_payload['status']} | Bank: {response_payload['bank']} | "
+        f"A/C: {response_payload['accountNumber']} | Holder: {response_payload['accountHolder']}\n"
+        f"Parser: {response_payload['parser']} | Confidence: {response_payload['parserConfidence']}\n"
+        f"Summary: {json.dumps(response_payload['summary'], indent=2)}\n"
+        f"Total Extracted Rows: {len(response_payload['transactions'])}\n"
+        f"================================================================"
+    )
+
+    return response_payload
