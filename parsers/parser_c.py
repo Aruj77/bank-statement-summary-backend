@@ -7,9 +7,8 @@ DATE_REGEX = re.compile(
     r"(?:^|\s)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})\b"
 )
 
-# Robust pattern for: Date ... Amount (CR|DR) Balance [Remarks]
 ROW_PATTERN = re.compile(
-    r"(?:^|\s)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})\s+(?:(.*?)\s+)?([\d,]+\.?\d*)\s+(CR|DR)\s+([\d,]+\.?\d*)(.*)$",
+    r"(?:^|\s)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})\s+(.*?)\s*([\d,]+\.?\d*)\s*(?:\((Dr|Cr)\)|(DR|CR))\s+([\d,]+\.?\d*)\s*(?:\((?:Dr|Cr)\)|(?:DR|CR))?(.*)$",
     re.I,
 )
 
@@ -19,7 +18,6 @@ def parse_parser_c(
     pages_layout: List[str] = None,
     metadata: Dict[str, Any] = None,
 ) -> List[Dict[str, Any]]:
-    # Use raw text by default, fallback to layout if empty
     lines_source = pages_text if pages_text else (pages_layout or [])
     all_lines = []
     for page in lines_source:
@@ -52,18 +50,18 @@ def parse_parser_c(
                     "type": curr_txn["type"],
                 })
 
-            date_str, prefix_info, amt_str, flag, bal_str, suffix_remarks = match.groups()
+            date_str, prefix_desc, amt_str, flag1, flag2, bal_str, suffix_desc = match.groups()
 
+            flag = (flag1 or flag2 or "DR").upper()
             amt = float(parse_decimal(amt_str))
             bal = float(parse_decimal(bal_str))
-            is_cr = flag.upper() == "CR"
+
+            is_cr = flag == "CR"
             withdrawal = 0.0 if is_cr else amt
             deposit = amt if is_cr else 0.0
             txn_type = "CREDIT" if is_cr else "DEBIT"
 
-            prefix = prefix_info.strip() if prefix_info else ""
-            suffix = suffix_remarks.strip() if suffix_remarks else ""
-            full_desc = f"{prefix} {suffix}".strip()
+            full_desc = f"{prefix_desc.strip()} {suffix_desc.strip()}".strip()
             full_desc = clean_description(full_desc)
 
             curr_txn = {
@@ -78,9 +76,9 @@ def parse_parser_c(
             }
             continue
 
-        # Multiline description continuation: Append only if line doesn't start with a Date
+        # Multiline description continuation: Append only if not starting a new date
         if curr_txn and not DATE_REGEX.search(line_str):
-            if not re.search(r"^(page\s*\d+|total|balance|statement|date\s+instrument)", line_str, re.I):
+            if not re.search(r"^(page\s*\d+|total|balance|statement|date\s+remarks)", line_str, re.I):
                 cleaned_sub = clean_description(line_str)
                 if cleaned_sub and len(cleaned_sub) > 2 and len(cleaned_sub) < 140:
                     curr_txn["full_narration"] += f" {cleaned_sub}"

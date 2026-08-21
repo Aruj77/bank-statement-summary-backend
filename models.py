@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Any
 from pydantic import BaseModel, Field
 
 
@@ -55,3 +55,23 @@ class ExtractionResponse(BaseModel):
     parserConfidence: float
     summary: StatementSummary
     transactions: List[NormalizedTransaction]
+
+class StatementPeriod(BaseModel):
+    startDate: Optional[str] = None
+    endDate: Optional[str] = None
+
+
+class StatementMetadata(BaseModel):
+    bankName: str = Field(default="Detected Bank", description="Official name of the bank")
+    accountHolder: str = Field(default="Account Holder", description="Full name of primary account holder")
+    accountNumber: str = Field(default="N/A", description="Complete account number without spaces")
+    ifscCode: Optional[str] = Field(default=None, description="11-character Indian Financial System Code")
+    micrCode: Optional[str] = Field(default=None, description="9-digit MICR code")
+    accountType: Optional[str] = Field(default="Savings Account", description="Savings, Current, Overdraft, etc.")
+    address: Optional[str] = Field(default=None, description="Customer or branch address if listed")
+    branch: Optional[str] = Field(default=None, description="Bank branch name or location")
+    panNumber: Optional[str] = Field(default=None, description="10-digit PAN number")
+    cifNumber: Optional[str] = Field(default=None, description="Customer ID / CIF / CRN")
+    statementPeriod: Optional[StatementPeriod] = None
+    openingBalance: Optional[str] = None
+    closingBalance: Optional[str] = None

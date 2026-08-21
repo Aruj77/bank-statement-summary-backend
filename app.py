@@ -5,6 +5,8 @@ from flask_cors import CORS
 from groq import Groq
 
 from core.pdf_processor import process_bank_statement
+from core.metadata_extractor import extract_statement_metadata_with_ai
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +28,6 @@ else:
 
 
 @app.route("/parse-pdf", methods=["POST"])
-@app.route("/api/extract-statement", methods=["POST"])
 def extract_statement_api():
     if "file" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded in form-data"}), 400
@@ -51,6 +52,32 @@ def extract_statement_api():
         app.logger.error(f"Internal processing failure: {e}", exc_info=True)
         return jsonify({"status": "error", "message": "Failed to parse bank statement PDF"}), 500
 
+
+@app.route("/api/extract-metadata", methods=["POST"])
+def extract_metadata_api():
+    """Dedicated API for extracting customer and account details from PDF header."""
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    password = request.form.get("password", None)
+    file_bytes = file.read()
+
+    if not file_bytes:
+        return jsonify({"status": "error", "message": "File is empty"}), 400
+
+    try:
+        metadata = extract_statement_metadata_with_ai(
+            file_bytes=file_bytes,
+            password=password,
+            openai_client=groq_client,
+        )
+        return jsonify({"status": "success", "data": metadata.model_dump()}), 200
+    except ValueError as ve:
+        return jsonify({"status": "error", "message": str(ve)}), 400
+    except Exception as e:
+        app.logger.error(f"Metadata extraction failure: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": "Failed to extract metadata"}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)

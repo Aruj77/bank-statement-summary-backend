@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import logging
 from decimal import Decimal
 from typing import Tuple, List, Dict, Any
@@ -24,6 +25,58 @@ class DecimalEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def reassemble_split_lines(text: str) -> str:
+    """
+    Normalizes multi-line wraps where the date is broken across distinct lines:
+    Example pattern:
+      Line 1: 05-04-
+      Line 2: Y83540919 UPIAR/... 202.00(Dr) 39823.54(Cr)
+      Line 3: 2025
+    Becomes:
+      05-04-2025 Y83540919 UPIAR/... 202.00(Dr) 39823.54(Cr)
+    """
+    if not text:
+        return ""
+
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    merged = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Case 1: "DD-MM-" on line i, txn content on line i+1, "YYYY" on line i+2
+        if (
+            re.match(r"^\d{1,2}[/-]\d{1,2}[/-]$", line)
+            and (i + 2 < len(lines))
+            and re.match(r"^\d{4}$", lines[i + 2])
+        ):
+            prefix_date = line.rstrip("-/")
+            body = lines[i + 1]
+            year = lines[i + 2]
+            merged.append(f"{prefix_date}-{year} {body}")
+            i += 3
+            continue
+
+        # Case 2: "DD-MM-" on line i, "YYYY <Rest of Row>" on line i+1
+        if (
+            re.match(r"^\d{1,2}[/-]\d{1,2}[/-]$", line)
+            and (i + 1 < len(lines))
+            and re.match(r"^\d{4}", lines[i + 1])
+        ):
+            prefix_date = line.rstrip("-/")
+            next_line = lines[i + 1]
+            year = next_line[:4]
+            rest = next_line[4:].strip()
+            merged.append(f"{prefix_date}-{year} {rest}")
+            i += 2
+            continue
+
+        merged.append(line)
+        i += 1
+
+    return "\n".join(merged)
+
+
 def extract_pdf_contents(file_bytes: bytes, password: str = None) -> Tuple[List[str], List[str], int]:
     pages_text = []
     pages_layout = []
@@ -33,8 +86,12 @@ def extract_pdf_contents(file_bytes: bytes, password: str = None) -> Tuple[List[
         logger.info(f"=== [RAW DATA] Starting extraction for {total_pages} pages ===")
         
         for idx, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            layout_text = page.extract_text(layout=True) or ""
+            raw_text = page.extract_text() or ""
+            raw_layout_text = page.extract_text(layout=True) or ""
+            
+            # Normalize split dates and fragmented table rows
+            text = reassemble_split_lines(raw_text)
+            layout_text = reassemble_split_lines(raw_layout_text)
             
             pages_text.append(text)
             pages_layout.append(layout_text)
