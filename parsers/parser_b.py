@@ -10,6 +10,10 @@ HEADER_NOISE_REGEX = re.compile(
     r"(date|narration|particulars|chq\s*\.?/?\s*ref\s*\.?\s*no|valuedt|value\s*date|withdrawalamt|depositamt|closingbalance|statement|page\s*\d+)",
     re.I,
 )
+CREDIT_KEYWORDS_REGEX = re.compile(
+    r"(chq\s*dep|cheque\s*dep|by\s*transfer|neft|rtgs|upiab|apbcr|deposit|salary|interest|int\.pd|cr\b)",
+    re.I,
+)
 
 
 def parse_parser_b(
@@ -67,7 +71,7 @@ def parse_parser_b(
                 narration = narration.replace(d_match.group(0), " ")
             for amt_str in amounts:
                 narration = narration.replace(amt_str, " ")
-            
+
             narration = HEADER_NOISE_REGEX.sub("", narration)
             full_narration = clean_description(narration)
 
@@ -93,10 +97,12 @@ def parse_parser_b(
     if curr_txn:
         raw_parsed_rows.append(curr_txn)
 
+    # Resolve Debit vs Credit accurately for single-amount columns
     transactions = []
     for i, t in enumerate(raw_parsed_rows):
         txn_amt = t["txnAmount"]
         curr_bal = t["balance"]
+        desc = t["full_narration"]
 
         if t["withdrawal"] is None or t["deposit"] is None:
             if i > 0:
@@ -112,10 +118,38 @@ def parse_parser_b(
                     t["deposit"] = 0.0
             else:
                 op_bal = float(metadata.get("openingBalance") or 0.0) if metadata else 0.0
-                if op_bal > 0 and (curr_bal - op_bal) > 0.001:
+                if op_bal > 0:
+                    diff = curr_bal - op_bal
+                    if diff > 0.001:
+                        t["type"] = "CREDIT"
+                        t["deposit"] = txn_amt
+                        t["withdrawal"] = 0.0
+                    else:
+                        t["type"] = "DEBIT"
+                        t["withdrawal"] = txn_amt
+                        t["deposit"] = 0.0
+                elif abs(curr_bal - txn_amt) < 0.01:
+                    # Balance equals transaction amount (e.g. 250000 == 250000) -> Credit
                     t["type"] = "CREDIT"
                     t["deposit"] = txn_amt
                     t["withdrawal"] = 0.0
+                elif CREDIT_KEYWORDS_REGEX.search(desc):
+                    # Narration clearly indicates a deposit/credit
+                    t["type"] = "CREDIT"
+                    t["deposit"] = txn_amt
+                    t["withdrawal"] = 0.0
+                elif len(raw_parsed_rows) > 1:
+                    next_bal = raw_parsed_rows[1]["balance"]
+                    next_amt = raw_parsed_rows[1]["txnAmount"]
+                    # If subtracting next txn from curr_bal equals next_bal -> curr_bal was positive deposit base
+                    if abs((curr_bal - next_amt) - next_bal) < 1.0:
+                        t["type"] = "CREDIT"
+                        t["deposit"] = txn_amt
+                        t["withdrawal"] = 0.0
+                    else:
+                        t["type"] = "DEBIT"
+                        t["withdrawal"] = txn_amt
+                        t["deposit"] = 0.0
                 else:
                     t["type"] = "DEBIT"
                     t["withdrawal"] = txn_amt

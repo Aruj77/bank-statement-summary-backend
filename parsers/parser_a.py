@@ -10,6 +10,10 @@ HEADER_NOISE_REGEX = re.compile(
     r"^(date|tran\s*id|transaction\s*particulars|withdrawal|deposit|balance|particulars|s\.?no)",
     re.I,
 )
+CREDIT_KEYWORDS_REGEX = re.compile(
+    r"(chq\s*dep|cheque\s*dep|by\s*transfer|neft|rtgs|upiab|apbcr|deposit|salary|interest|int\.pd|cr\b)",
+    re.I,
+)
 
 
 def parse_parser_a(
@@ -76,7 +80,6 @@ def parse_parser_a(
             }
             continue
 
-        # Multiline narration append
         if curr_txn and not dates_found and len(amounts) == 0:
             if not re.search(r"^(page\s*\d+|total|opening|closing)", line_str, re.I):
                 cleaned_sub = clean_description(line_str)
@@ -86,11 +89,11 @@ def parse_parser_a(
     if curr_txn:
         raw_parsed_rows.append(curr_txn)
 
-    # Balance reconciliation to resolve DEBIT vs CREDIT
     transactions = []
     for i, t in enumerate(raw_parsed_rows):
         txn_amt = t["txnAmount"]
         curr_bal = t["balance"]
+        desc = t["full_narration"]
 
         if t["withdrawal"] is None or t["deposit"] is None:
             if i > 0:
@@ -105,11 +108,37 @@ def parse_parser_a(
                     t["withdrawal"] = txn_amt
                     t["deposit"] = 0.0
             else:
+                # FIRST ROW DETERMINATION
                 op_bal = float(metadata.get("openingBalance") or 0.0) if metadata else 0.0
-                if op_bal > 0 and (curr_bal - op_bal) > 0.001:
+                if op_bal > 0:
+                    diff = curr_bal - op_bal
+                    if diff > 0.001:
+                        t["type"] = "CREDIT"
+                        t["deposit"] = txn_amt
+                        t["withdrawal"] = 0.0
+                    else:
+                        t["type"] = "DEBIT"
+                        t["withdrawal"] = txn_amt
+                        t["deposit"] = 0.0
+                elif abs(curr_bal - txn_amt) < 0.01:
                     t["type"] = "CREDIT"
                     t["deposit"] = txn_amt
                     t["withdrawal"] = 0.0
+                elif CREDIT_KEYWORDS_REGEX.search(desc):
+                    t["type"] = "CREDIT"
+                    t["deposit"] = txn_amt
+                    t["withdrawal"] = 0.0
+                elif len(raw_parsed_rows) > 1:
+                    next_bal = raw_parsed_rows[1]["balance"]
+                    next_amt = raw_parsed_rows[1]["txnAmount"]
+                    if abs((curr_bal - next_amt) - next_bal) < 1.0:
+                        t["type"] = "CREDIT"
+                        t["deposit"] = txn_amt
+                        t["withdrawal"] = 0.0
+                    else:
+                        t["type"] = "DEBIT"
+                        t["withdrawal"] = txn_amt
+                        t["deposit"] = 0.0
                 else:
                     t["type"] = "DEBIT"
                     t["withdrawal"] = txn_amt
