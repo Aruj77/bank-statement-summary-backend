@@ -1,6 +1,7 @@
 from decimal import Decimal
-from typing import List, Optional, Any
-from pydantic import BaseModel, Field
+from typing import List, Optional, Any, Union
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+from core.normalizer import parse_date
 
 
 class ParserDetection(BaseModel):
@@ -24,6 +25,8 @@ class ParserDetection(BaseModel):
 
 
 class NormalizedTransaction(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     index: int = Field(alias="_index")
     sNo: Optional[int] = None
     date: str
@@ -36,6 +39,21 @@ class NormalizedTransaction(BaseModel):
     amount: Decimal
     balance: Optional[Decimal] = None
     type: str  # "DEBIT" | "CREDIT"
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def validate_date(cls, v: Any) -> str:
+        """Standardizes date to DD/MM/YYYY."""
+        return parse_date(str(v)) if v else ""
+
+    @field_validator("valueDate", mode="before")
+    @classmethod
+    def validate_value_date(cls, v: Any, info) -> str:
+        """Standardizes valueDate to DD/MM/YYYY; falls back to 'date' if empty."""
+        if v and str(v).strip():
+            return parse_date(str(v))
+        # Fallback to primary transaction date if valueDate is missing
+        return parse_date(str(info.data.get("date", "")))
 
 
 class StatementSummary(BaseModel):
@@ -51,14 +69,25 @@ class StatementSummary(BaseModel):
 class ExtractionResponse(BaseModel):
     status: str
     bank: str
+    accountNumber: Optional[str] = "N/A"
+    accountHolder: Optional[str] = "Account Holder"
+    accountType: Optional[str] = "Savings / Current"
     parser: str
     parserConfidence: float
     summary: StatementSummary
     transactions: List[NormalizedTransaction]
 
+
 class StatementPeriod(BaseModel):
     startDate: Optional[str] = None
     endDate: Optional[str] = None
+
+    @field_validator("startDate", "endDate", mode="before")
+    @classmethod
+    def normalize_period_dates(cls, v: Any) -> Optional[str]:
+        if not v or str(v).strip() in ("", "None", "null"):
+            return None
+        return parse_date(str(v))
 
 
 class StatementMetadata(BaseModel):

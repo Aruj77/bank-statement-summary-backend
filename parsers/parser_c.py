@@ -1,10 +1,9 @@
 import re
-from decimal import Decimal
 from typing import List, Dict, Any, Optional
 from core.normalizer import parse_decimal, clean_description, parse_date
 
 DATE_REGEX = re.compile(
-    r"(?:^|\s)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})\b"
+    r"(?:^|\s)(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}[\s-][A-Za-z]{3}[\s-]\d{2,4})\b"
 )
 
 ROW_PATTERN = re.compile(
@@ -64,9 +63,11 @@ def parse_parser_c(
             full_desc = f"{prefix_desc.strip()} {suffix_desc.strip()}".strip()
             full_desc = clean_description(full_desc)
 
+            formatted_date = parse_date(date_str)
+
             curr_txn = {
-                "date": parse_date(date_str),
-                "valueDate": parse_date(date_str),
+                "date": formatted_date,
+                "valueDate": formatted_date,
                 "full_narration": full_desc,
                 "txnAmount": amt,
                 "withdrawal": withdrawal,
@@ -76,11 +77,10 @@ def parse_parser_c(
             }
             continue
 
-        # Multiline description continuation: Append only if not starting a new date
         if curr_txn and not DATE_REGEX.search(line_str):
             if not re.search(r"^(page\s*\d+|total|balance|statement|date\s+remarks)", line_str, re.I):
                 cleaned_sub = clean_description(line_str)
-                if cleaned_sub and len(cleaned_sub) > 2 and len(cleaned_sub) < 140:
+                if cleaned_sub and 2 < len(cleaned_sub) < 140:
                     curr_txn["full_narration"] += f" {cleaned_sub}"
 
     if curr_txn:

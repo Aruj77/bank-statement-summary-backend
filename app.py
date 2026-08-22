@@ -7,16 +7,16 @@ from groq import Groq
 from core.pdf_processor import process_bank_statement
 from core.metadata_extractor import extract_statement_metadata_with_ai
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger("BankStatementAPI")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Read API Key from environment variable or set your default fallback
+# Read API Key from environment variable
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 # Initialize Groq client safely
@@ -24,10 +24,11 @@ groq_client = None
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
 else:
-    app.logger.warning("GROQ_API_KEY not found in environment. Heuristics fallback will be used until key is set.")
+    logger.warning("GROQ_API_KEY not found in environment. Heuristics fallback will be used until key is set.")
 
 
 @app.route("/parse-pdf", methods=["POST"])
+@app.route("/api/extract-statement", methods=["POST"])
 def extract_statement_api():
     if "file" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded in form-data"}), 400
@@ -47,9 +48,12 @@ def extract_statement_api():
         )
         return jsonify(result), 200
     except ValueError as ve:
-        return jsonify({"status": "error", "message": str(ve)}), 400
+        err_msg = str(ve)
+        if "INCORRECT_PASSWORD" in err_msg or "PDF_PASSWORD_REQUIRED" in err_msg:
+            return jsonify({"status": "error", "message": err_msg}), 401
+        return jsonify({"status": "error", "message": err_msg}), 400
     except Exception as e:
-        app.logger.error(f"Internal processing failure: {e}", exc_info=True)
+        logger.error(f"Internal processing failure: {e}", exc_info=True)
         return jsonify({"status": "error", "message": "Failed to parse bank statement PDF"}), 500
 
 
@@ -74,10 +78,14 @@ def extract_metadata_api():
         )
         return jsonify({"status": "success", "data": metadata.model_dump()}), 200
     except ValueError as ve:
-        return jsonify({"status": "error", "message": str(ve)}), 400
+        err_msg = str(ve)
+        if "INCORRECT_PASSWORD" in err_msg or "PDF_PASSWORD_REQUIRED" in err_msg:
+            return jsonify({"status": "error", "message": err_msg}), 401
+        return jsonify({"status": "error", "message": err_msg}), 400
     except Exception as e:
-        app.logger.error(f"Metadata extraction failure: {e}", exc_info=True)
+        logger.error(f"Metadata extraction failure: {e}", exc_info=True)
         return jsonify({"status": "error", "message": "Failed to extract metadata"}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
