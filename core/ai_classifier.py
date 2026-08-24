@@ -45,7 +45,7 @@ def classify_table_layout_with_llm(
         f"### Statement Table Sample:\n{sample_text}\n"
     )
 
-    # Models prioritized from your active Groq quota list
+    # EXACT ACTIVE_MODELS LIST PRESERVED
     ACTIVE_MODELS = [
         "groq/compound-mini",
         "openai/gpt-oss-20b",
@@ -72,17 +72,37 @@ def classify_table_layout_with_llm(
 
     # Heuristic Fallback Analysis
     sample_upper = sample_text.upper()
-    if re.search(r"\b(CR|DR)\b", sample_upper) and re.search(r"\d+\.\d+", sample_text):
+
+    # 1. Match PARSER_D: Txn No., S-series IDs (e.g. S46657705)
+    if ("TXN NO" in sample_upper or "KIMS" in sample_upper) or re.search(r"\bS\d{7,10}\b", sample_text):
+        return ParserDetection(
+            parser="PARSER_D",
+            confidence=0.95,
+            table_type="TXN_NO_DATE_DESC_DR_CR_BAL",
+            debit_credit_method="EXPLICIT_COLUMNS",
+            multiline_transactions=True,
+            layout_required=False,
+            reasoning="Heuristic detected Txn ID + Date + Dr/Cr layout with dash placeholders",
+        )
+
+    # 2. Match PARSER_C: Type column (CR/DR) or Amount with (CR/DR) / CR DR tokens
+    if re.search(r"\b(CR|DR)\b", sample_upper) and (
+        "INSTRUMENT" in sample_upper
+        or "TYPE" in sample_upper
+        or re.search(r"\d+\.?\d*\s+(?:CR|DR)\s+\d+\.?\d*", sample_text, re.I)
+        or re.search(r"\d+\.\d{2}\s*\((?:Dr|Cr)\)", sample_text, re.I)
+    ):
         return ParserDetection(
             parser="PARSER_C",
-            confidence=0.92,
+            confidence=0.95,
             table_type="DATE_AMT_CRDR_BAL_REMARKS",
             debit_credit_method="CR_DR_FLAG",
-            multiline_transactions=False,
+            multiline_transactions=True,
             layout_required=False,
             reasoning="Heuristic detected Date + Amount + CR/DR Flag + Balance layout",
         )
 
+    # 3. Match PARSER_B: Separate Withdrawal and Deposit columns
     if ("WITHDRAWAL" in sample_upper and "DEPOSIT" in sample_upper) or ("DEBIT" in sample_upper and "CREDIT" in sample_upper):
         return ParserDetection(
             parser="PARSER_B",
@@ -94,6 +114,7 @@ def classify_table_layout_with_llm(
             reasoning="Heuristic detected separate Debit and Credit columns",
         )
 
+    # Default Fallback: PARSER_A
     return ParserDetection(
         parser="PARSER_A",
         confidence=0.60,

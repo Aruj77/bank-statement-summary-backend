@@ -34,10 +34,12 @@ PARSER_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "PARSER_D": {
         "fn": parse_parser_d,
-        "description": "Txn Date | Value Date | Chq/Ref No | Description | Debit | Credit | Balance",
+        "description": "Txn No. | Txn Date | Description | Branch Name | Cheque No. | Dr Amount | Cr Amount | Balance | KIMS Remarks",
         "features": [
-            "Multiple date columns present (Txn Date vs Value Date)",
-            "Cheque or reference number column exists",
+            "Unique Txn No. per row (e.g. S46657705) - most reliable row anchor",
+            "Branch Name and Cheque No. columns are almost always '-' placeholders",
+            "Separate Dr Amount / Cr Amount columns but only one is populated per row",
+            "Descriptions can wrap across multiple lines (multiline_transactions)",
         ],
     },
     "PARSER_E": {
