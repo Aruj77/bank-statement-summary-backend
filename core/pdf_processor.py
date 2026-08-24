@@ -27,13 +27,7 @@ class DecimalEncoder(json.JSONEncoder):
 
 def reassemble_split_lines(text: str) -> str:
     """
-    Normalizes multi-line wraps where the date is broken across distinct lines:
-    Example pattern:
-      Line 1: 05-04-
-      Line 2: Y83540919 UPIAR/... 202.00(Dr) 39823.54(Cr)
-      Line 3: 2025
-    Becomes:
-      05-04-2025 Y83540919 UPIAR/... 202.00(Dr) 39823.54(Cr)
+    Normalizes multi-line wraps where the date or amounts are broken across distinct lines.
     """
     if not text:
         return ""
@@ -71,6 +65,28 @@ def reassemble_split_lines(text: str) -> str:
             i += 2
             continue
 
+        # Case 3: "DD-MM- <Amounts/Rest>" on line i, "YYYY <Rest of Row>" on line i+1
+        m_split_date = re.match(r"^(\d{1,2}[/-]\d{1,2}[/-])\s+(.*)$", line)
+        if m_split_date and (i + 1 < len(lines)) and re.match(r"^\d{4}\b", lines[i + 1]):
+            prefix_date = m_split_date.group(1).rstrip("-/")
+            top_rest = m_split_date.group(2)
+            next_line = lines[i + 1]
+            year = next_line[:4]
+            bottom_rest = next_line[4:].strip()
+            merged.append(f"{prefix_date}-{year} {bottom_rest} {top_rest}")
+            i += 2
+            continue
+
+        # Case 4: Amount on line i, and "(Cr)" or "(Dr)" on line i+1
+        if (
+            re.match(r"^[\d,]+\.\d{2}$", line)
+            and (i + 1 < len(lines))
+            and re.match(r"^\(?(?:Dr|Cr|DR|CR)\)?$", lines[i + 1], re.I)
+        ):
+            merged.append(f"{line}{lines[i + 1]}")
+            i += 2
+            continue
+
         merged.append(line)
         i += 1
 
@@ -80,30 +96,48 @@ def reassemble_split_lines(text: str) -> str:
 def extract_pdf_contents(file_bytes: bytes, password: str = None) -> Tuple[List[str], List[str], int]:
     pages_text = []
     pages_layout = []
-    
+
     with pdfplumber.open(io.BytesIO(file_bytes), password=password) as pdf:
         total_pages = len(pdf.pages)
         logger.info(f"=== [RAW DATA] Starting extraction for {total_pages} pages ===")
-        
+
         for idx, page in enumerate(pdf.pages):
             raw_text = page.extract_text() or ""
             raw_layout_text = page.extract_text(layout=True) or ""
-            
-            # Normalize split dates and fragmented table rows
+
+            # Check if pdfplumber can extract structured grid tables directly
+            tables = page.extract_tables()
+            if tables and any(len(t) > 2 for t in tables):
+                table_lines = []
+                for t in tables:
+                    for row in t:
+                        if not row:
+                            continue
+                        cleaned_cells = []
+                        for cell in row:
+                            if cell:
+                                # Normalize intra-cell line wraps e.g. "18-06-\n2025" -> "18-06-2025"
+                                c_clean = re.sub(r"(\d{1,2}[/-]\d{1,2}[/-])\s*\n\s*(\d{2,4})", r"\1\2", cell)
+                                c_clean = re.sub(r"([\d,]+\.?\d*)\s*\n\s*(\((?:Dr|Cr)\)|(?:DR|CR))", r"\1\2", c_clean, flags=re.I)
+                                c_clean = " ".join(c_clean.split())
+                                if c_clean:
+                                    cleaned_cells.append(c_clean)
+                        if cleaned_cells:
+                            table_lines.append(" ".join(cleaned_cells))
+
+                if table_lines:
+                    text_result = "\n".join(table_lines)
+                    pages_text.append(text_result)
+                    pages_layout.append(text_result)
+                    continue
+
+            # Fallback to text parsing with split line reassembly
             text = reassemble_split_lines(raw_text)
             layout_text = reassemble_split_lines(raw_layout_text)
-            
+
             pages_text.append(text)
             pages_layout.append(layout_text)
-            
-            logger.debug(
-                f"\n--- [RAW PDF TEXT - PAGE {idx + 1}/{total_pages}] ---\n"
-                f"{text}\n"
-                f"--- [RAW LAYOUT TEXT - PAGE {idx + 1}/{total_pages}] ---\n"
-                f"{layout_text}\n"
-                f"{'-' * 50}"
-            )
-            
+
     return pages_text, pages_layout, total_pages
 
 
@@ -156,8 +190,7 @@ def process_bank_statement(
 
         try:
             raw_txns = parser_entry["fn"](pages_text, pages_layout, meta)
-            
-            # Log sample raw parsed transactions
+
             formatted_txns = json.dumps(raw_txns[:5], indent=2, cls=DecimalEncoder)
             logger.info(
                 f"\n--- [RAW PARSED SAMPLE - FIRST {min(5, len(raw_txns))} of {len(raw_txns)} ROWS via {parser_id}] ---\n"
@@ -194,7 +227,6 @@ def process_bank_statement(
 
     final_parser_id, final_txns, final_val = best_result
 
-    # Construct the unified response payload required by the frontend
     response_payload = {
         "status": "success",
         "bank": meta.get("bank", "Detected Bank"),
