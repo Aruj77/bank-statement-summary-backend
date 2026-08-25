@@ -8,18 +8,28 @@ DATE_REGEX = re.compile(
 AMOUNT_PATTERN = r"[\d,]+\.?\d*"
 
 HEADER_FOOTER_REGEX = re.compile(
-    r"(statement\s+of\s+account|for\s+period|date\s*instrument\s*id|generated\s+through|unless\s+constituent|please\s+do\s+not\s+accept|abbreviations\s+are|date:\s*\d{1,2}/\d{1,2}/\d{2,4}|page\s*\d+)",
+    r"(statement\s+of\s+account|for\s+period|date\s+amount\s+type|date\s*instrument\s*id|generated\s+through|unless\s+constituent|please\s+do\s+not\s+accept|abbreviations\s+are|date:\s*\d{1,2}/\d{1,2}/\d{2,4}|page\s*\d+\s+of|page\s*\d+)",
     re.I,
 )
 
-# Robust Regex matching Date + Description + Amount(Dr/Cr) + Balance(Dr/Cr)
-ROW_PATTERN = re.compile(
-    r"(?:^|\s)(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})\s+(.*?)\s*([\d,]+\.?\d*)\s*(?:\((Dr|Cr)\)|(DR|CR))\s+([\d,]+\.?\d*)\s*(?:\((Dr|Cr)\)|(DR|CR))?\s*(.*)$",
+# Pattern 1: Date  [₹]Amount  (DEBIT|CREDIT|DR|CR)  [Instrument No]  [₹]Balance  Remarks
+# Example: 06-07-2026 ₹267.00 DEBIT NA ₹8519.20 UPI/DR/...
+PATTERN_FORMAT_A = re.compile(
+    rf"(?:^|\s)(\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}})\s+[₹Rs.\s]*({AMOUNT_PATTERN})\s+(DEBIT|CREDIT|DR|CR)\s+(?:[A-Za-z0-9_/-]+\s+)?[₹Rs.\s]*({AMOUNT_PATTERN})\s*(.*)$",
     re.I,
 )
 
-TYPE1_PATTERN = re.compile(
-    r"(?:^|\s)(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})\s+(?:[A-Za-z0-9_/-]+\s+)?([\d,]+\.?\d*)\s+(CR|DR)\s+([\d,]+\.?\d*)\s*(.*)$",
+# Pattern 2: Date  [Instrument ID]  Amount  (CR|DR|DEBIT|CREDIT)  Balance  Remarks
+# Example: 20/08/2025 1130.0 CR 42207.6 NEFT_IN:...
+PATTERN_FORMAT_B = re.compile(
+    rf"(?:^|\s)(\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}})\s+(?:[A-Za-z0-9_/-]+\s+)?([₹Rs.\s]*{AMOUNT_PATTERN})\s+(CR|DR|DEBIT|CREDIT)\s+[₹Rs.\s]*({AMOUNT_PATTERN})\s*(.*)$",
+    re.I,
+)
+
+# Pattern 3: Date  Remarks  Amount(Dr/Cr)  Balance(Dr/Cr)
+# Example: 18-06-2025 T33423894 UPIAR/... 302.00(Dr) 2799.59(Cr)
+PATTERN_FORMAT_C = re.compile(
+    rf"(?:^|\s)(\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}}|\d{{1,2}}\s+[A-Za-z]{{3}}\s+\d{{2,4}})\s+(.*?)\s*[₹Rs.\s]*({AMOUNT_PATTERN})\s*(?:\((Dr|Cr)\)|(DR|CR|DEBIT|CREDIT))\s+[₹Rs.\s]*({AMOUNT_PATTERN})\s*(?:\((Dr|Cr)\)|(DR|CR|DEBIT|CREDIT))?\s*(.*)$",
     re.I,
 )
 
@@ -42,17 +52,17 @@ def parse_parser_c(
         if not line_str or HEADER_FOOTER_REGEX.search(line_str):
             continue
 
-        # Check for Type 1: Date [Instrument ID] Amount Type(CR/DR) Balance Remarks
-        m_type1 = TYPE1_PATTERN.search(line_str)
-        if m_type1:
+        # Match Format A: Date -> Amount -> Type -> Instrument -> Balance -> Remarks
+        m_a = PATTERN_FORMAT_A.search(line_str)
+        if m_a:
             if curr_txn:
                 raw_txns.append(curr_txn)
 
-            date_str, amt_str, flag_str, bal_str, rem_str = m_type1.groups()
+            date_str, amt_str, flag_str, bal_str, rem_str = m_a.groups()
             flag = flag_str.upper()
             amt = float(parse_decimal(amt_str))
             bal = float(parse_decimal(bal_str))
-            is_cr = flag == "CR"
+            is_cr = flag in ("CR", "CREDIT")
 
             curr_txn = {
                 "date": parse_date(date_str),
@@ -67,20 +77,45 @@ def parse_parser_c(
             }
             continue
 
-        # Check for Type 2: Date Remarks Amount(Dr/Cr) Balance(Dr/Cr)
-        m_type2 = ROW_PATTERN.search(line_str)
-        if m_type2:
+        # Match Format B: Date -> [Instrument] -> Amount -> Type -> Balance -> Remarks
+        m_b = PATTERN_FORMAT_B.search(line_str)
+        if m_b:
             if curr_txn:
                 raw_txns.append(curr_txn)
 
-            date_str, prefix_desc, amt_str, f1, f2, bal_str, f3, suffix_desc = m_type2.groups()
-            flag = (f1 or f2 or "DR").upper()
+            date_str, amt_str, flag_str, bal_str, rem_str = m_b.groups()
+            flag = flag_str.upper()
             amt = float(parse_decimal(amt_str))
             bal = float(parse_decimal(bal_str))
-            is_cr = flag == "CR"
+            is_cr = flag in ("CR", "CREDIT")
+
+            curr_txn = {
+                "date": parse_date(date_str),
+                "valueDate": parse_date(date_str),
+                "txnAmount": amt,
+                "amount": amt,
+                "withdrawal": 0.0 if is_cr else amt,
+                "deposit": amt if is_cr else 0.0,
+                "balance": bal,
+                "type": "CREDIT" if is_cr else "DEBIT",
+                "narration_parts": [rem_str.strip()] if rem_str.strip() else [],
+            }
+            continue
+
+        # Match Format C: Date -> Remarks -> Amount(Dr/Cr) -> Balance(Dr/Cr)
+        m_c = PATTERN_FORMAT_C.search(line_str)
+        if m_c:
+            if curr_txn:
+                raw_txns.append(curr_txn)
+
+            date_str, prefix_desc, amt_str, f1, f2, bal_str, f3, f4, suffix_desc = m_c.groups()
+            flag = (f1 or f2 or f3 or f4 or "DR").upper()
+            amt = float(parse_decimal(amt_str))
+            bal = float(parse_decimal(bal_str))
+            is_cr = flag in ("CR", "CREDIT")
 
             full_desc = f"{prefix_desc.strip()} {suffix_desc.strip()}".strip()
-            full_desc = re.sub(r"\(?(Dr|Cr|DR|CR)\)?$", "", full_desc, flags=re.I).strip()
+            full_desc = re.sub(r"\(?(Dr|Cr|DR|CR|DEBIT|CREDIT)\)?$", "", full_desc, flags=re.I).strip()
 
             curr_txn = {
                 "date": parse_date(date_str),
@@ -95,11 +130,12 @@ def parse_parser_c(
             }
             continue
 
-        # Multiline description continuation: Append only text without dates or stray balance lines
+        # Multiline remarks continuation
         if curr_txn and not DATE_REGEX.search(line_str):
             if not HEADER_FOOTER_REGEX.search(line_str):
                 cleaned_sub = clean_description(line_str)
-                if cleaned_sub and len(cleaned_sub) > 1 and not re.match(r"^[\d,]+\.?\d*\s*\(?(?:Cr|Dr)?\)?\.?$", cleaned_sub, re.I):
+                # Ignore isolated page headers or pure numeric artifact strings
+                if cleaned_sub and len(cleaned_sub) > 1 and not re.match(r"^[₹Rs.\d,]+\.?\d*\s*\(?(?:Cr|Dr)?\)?\.?$", cleaned_sub, re.I):
                     curr_txn["narration_parts"].append(cleaned_sub)
 
     if curr_txn:
