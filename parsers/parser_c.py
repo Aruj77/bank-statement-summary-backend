@@ -1,11 +1,11 @@
 import re
 from typing import List, Dict, Any, Optional
-from core.normalizer import parse_decimal, clean_description, parse_date
+from core.normalizer import clean_description, parse_date
 
 DATE_REGEX = re.compile(
     r"(?:^|\s)(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})\b"
 )
-AMOUNT_PATTERN = r"[\d,]+\.?\d*"
+AMOUNT_PATTERN = r"-?[\d,]+\.?\d*"
 
 HEADER_FOOTER_REGEX = re.compile(
     r"(statement\s+of\s+account|for\s+period|date\s+amount\s+type|date\s*instrument\s*id|generated\s+through|unless\s+constituent|please\s+do\s+not\s+accept|abbreviations\s+are|date:\s*\d{1,2}/\d{1,2}/\d{2,4}|page\s*\d+\s+of|page\s*\d+)",
@@ -13,25 +13,36 @@ HEADER_FOOTER_REGEX = re.compile(
 )
 
 # Pattern 1: Date  [₹]Amount  (DEBIT|CREDIT|DR|CR)  [Instrument No]  [₹]Balance  Remarks
-# Example: 06-07-2026 ₹267.00 DEBIT NA ₹8519.20 UPI/DR/...
 PATTERN_FORMAT_A = re.compile(
     rf"(?:^|\s)(\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}})\s+[₹Rs.\s]*({AMOUNT_PATTERN})\s+(DEBIT|CREDIT|DR|CR)\s+(?:[A-Za-z0-9_/-]+\s+)?[₹Rs.\s]*({AMOUNT_PATTERN})\s*(.*)$",
     re.I,
 )
 
 # Pattern 2: Date  [Instrument ID]  Amount  (CR|DR|DEBIT|CREDIT)  Balance  Remarks
-# Example: 20/08/2025 1130.0 CR 42207.6 NEFT_IN:...
+# Handles: 06/05/2025 396063 300000.0 DR -247630.13 TO SELF
 PATTERN_FORMAT_B = re.compile(
     rf"(?:^|\s)(\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}})\s+(?:[A-Za-z0-9_/-]+\s+)?([₹Rs.\s]*{AMOUNT_PATTERN})\s+(CR|DR|DEBIT|CREDIT)\s+[₹Rs.\s]*({AMOUNT_PATTERN})\s*(.*)$",
     re.I,
 )
 
 # Pattern 3: Date  Remarks  Amount(Dr/Cr)  Balance(Dr/Cr)
-# Example: 18-06-2025 T33423894 UPIAR/... 302.00(Dr) 2799.59(Cr)
 PATTERN_FORMAT_C = re.compile(
     rf"(?:^|\s)(\d{{1,2}}[/.-]\d{{1,2}}[/.-]\d{{2,4}}|\d{{1,2}}\s+[A-Za-z]{{3}}\s+\d{{2,4}})\s+(.*?)\s*[₹Rs.\s]*({AMOUNT_PATTERN})\s*(?:\((Dr|Cr)\)|(DR|CR|DEBIT|CREDIT))\s+[₹Rs.\s]*({AMOUNT_PATTERN})\s*(?:\((Dr|Cr)\)|(DR|CR|DEBIT|CREDIT))?\s*(.*)$",
     re.I,
 )
+
+
+def _safe_float(val_str: str) -> float:
+    """Safely converts string to float preserving negative signs."""
+    if not val_str:
+        return 0.0
+    clean = str(val_str).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
+    is_neg = clean.startswith("-") or "(-" in clean
+    num_part = re.sub(r"[^\d.]", "", clean)
+    if not num_part:
+        return 0.0
+    val = float(num_part)
+    return -val if is_neg else val
 
 
 def parse_parser_c(
@@ -60,8 +71,8 @@ def parse_parser_c(
 
             date_str, amt_str, flag_str, bal_str, rem_str = m_a.groups()
             flag = flag_str.upper()
-            amt = float(parse_decimal(amt_str))
-            bal = float(parse_decimal(bal_str))
+            amt = abs(_safe_float(amt_str))
+            bal = _safe_float(bal_str)
             is_cr = flag in ("CR", "CREDIT")
 
             curr_txn = {
@@ -85,8 +96,8 @@ def parse_parser_c(
 
             date_str, amt_str, flag_str, bal_str, rem_str = m_b.groups()
             flag = flag_str.upper()
-            amt = float(parse_decimal(amt_str))
-            bal = float(parse_decimal(bal_str))
+            amt = abs(_safe_float(amt_str))
+            bal = _safe_float(bal_str)
             is_cr = flag in ("CR", "CREDIT")
 
             curr_txn = {
@@ -110,8 +121,8 @@ def parse_parser_c(
 
             date_str, prefix_desc, amt_str, f1, f2, bal_str, f3, f4, suffix_desc = m_c.groups()
             flag = (f1 or f2 or f3 or f4 or "DR").upper()
-            amt = float(parse_decimal(amt_str))
-            bal = float(parse_decimal(bal_str))
+            amt = abs(_safe_float(amt_str))
+            bal = _safe_float(bal_str)
             is_cr = flag in ("CR", "CREDIT")
 
             full_desc = f"{prefix_desc.strip()} {suffix_desc.strip()}".strip()
@@ -134,8 +145,7 @@ def parse_parser_c(
         if curr_txn and not DATE_REGEX.search(line_str):
             if not HEADER_FOOTER_REGEX.search(line_str):
                 cleaned_sub = clean_description(line_str)
-                # Ignore isolated page headers or pure numeric artifact strings
-                if cleaned_sub and len(cleaned_sub) > 1 and not re.match(r"^[₹Rs.\d,]+\.?\d*\s*\(?(?:Cr|Dr)?\)?\.?$", cleaned_sub, re.I):
+                if cleaned_sub and len(cleaned_sub) > 1 and not re.match(r"^[-₹Rs.\d,]+\.?\d*\s*\(?(?:Cr|Dr|CR|DR|DEBIT|CREDIT)?\)?\.?$", cleaned_sub, re.I):
                     curr_txn["narration_parts"].append(cleaned_sub)
 
     if curr_txn:
