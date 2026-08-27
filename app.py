@@ -10,27 +10,28 @@ from core.metadata_extractor import extract_statement_metadata_with_ai
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("BankStatementAPI")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Read API Key from environment variable
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-
-# Initialize Groq client safely
 groq_client = None
+
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
+    logger.info("Groq client initialized successfully.")
 else:
-    logger.warning("GROQ_API_KEY not found in environment. Heuristics fallback will be used until key is set.")
+    logger.warning("GROQ_API_KEY not found. Heuristics fallback active.")
 
 
 @app.route("/parse-pdf", methods=["POST"])
 @app.route("/api/extract-statement", methods=["POST"])
 def extract_statement_api():
     if "file" not in request.files:
+        logger.warning("[API] Request rejected: Missing file in form-data.")
         return jsonify({"status": "error", "message": "No file uploaded in form-data"}), 400
 
     file = request.files["file"]
@@ -38,7 +39,10 @@ def extract_statement_api():
     file_bytes = file.read()
 
     if not file_bytes:
+        logger.warning("[API] Request rejected: Uploaded file is empty.")
         return jsonify({"status": "error", "message": "Uploaded file is empty"}), 400
+
+    logger.info(f"[API] Processing '{file.filename}' ({len(file_bytes) / 1024:.1f} KB)...")
 
     try:
         result = process_bank_statement(
@@ -46,20 +50,23 @@ def extract_statement_api():
             password=password,
             openai_client=groq_client,
         )
+        tx_count = result.get("summary", {}).get("transactionCount", len(result.get("transactions", [])))
+        logger.info(f"[API] Successfully parsed '{file.filename}' -> {tx_count} transactions via {result.get('parser')}.")
         return jsonify(result), 200
+
     except ValueError as ve:
         err_msg = str(ve)
-        if "INCORRECT_PASSWORD" in err_msg or "PDF_PASSWORD_REQUIRED" in err_msg:
-            return jsonify({"status": "error", "message": err_msg}), 401
-        return jsonify({"status": "error", "message": err_msg}), 400
+        logger.warning(f"[API] Auth/Validation error on '{file.filename}': {err_msg}")
+        status_code = 401 if "PASSWORD" in err_msg.upper() else 400
+        return jsonify({"status": "error", "message": err_msg}), status_code
+
     except Exception as e:
-        logger.error(f"Internal processing failure: {e}", exc_info=True)
+        logger.error(f"[API] Processing failed on '{file.filename}': {e}", exc_info=True)
         return jsonify({"status": "error", "message": "Failed to parse bank statement PDF"}), 500
 
 
 @app.route("/api/extract-metadata", methods=["POST"])
 def extract_metadata_api():
-    """Dedicated API for extracting customer and account details from PDF header."""
     if "file" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded"}), 400
 
@@ -77,13 +84,8 @@ def extract_metadata_api():
             openai_client=groq_client,
         )
         return jsonify({"status": "success", "data": metadata.model_dump()}), 200
-    except ValueError as ve:
-        err_msg = str(ve)
-        if "INCORRECT_PASSWORD" in err_msg or "PDF_PASSWORD_REQUIRED" in err_msg:
-            return jsonify({"status": "error", "message": err_msg}), 401
-        return jsonify({"status": "error", "message": err_msg}), 400
     except Exception as e:
-        logger.error(f"Metadata extraction failure: {e}", exc_info=True)
+        logger.error(f"[API] Metadata extraction error: {e}")
         return jsonify({"status": "error", "message": "Failed to extract metadata"}), 500
 
 
