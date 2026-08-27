@@ -32,6 +32,13 @@ def reassemble_split_lines(text: str) -> str:
     if not text:
         return ""
 
+    # Pass 0: Fix glued Date + Text (e.g. "08-05-2025MOBILE" -> "08-05-2025 MOBILE", "22-04-2025ICICI" -> "22-04-2025 ICICI")
+    text = re.sub(
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})([A-Za-z])",
+        r"\1 \2",
+        text
+    )
+
     # Pass 1: Attach wrapped (Cr)/(Dr) flags to amounts: "1000.00 \n (Cr)" -> "1000.00(Cr)"
     text = re.sub(r"([\d,]+\.\d{2})\s*\n\s*\(([CcRrDdEeBbIitT]{2,6})\)", r"\1(\2)", text)
     text = re.sub(r"([\d,]+\.\d{2})\s*\n\s*([Cc][Rr]|[Dd][Rr])\b", r"\1(\2)", text)
@@ -51,15 +58,13 @@ def reassemble_split_lines(text: str) -> str:
     while i < len(lines):
         line = lines[i]
 
-        # STRICT Union Bank Rule: Line MUST end with an open hyphen or slash (e.g., '19-06-' or '19/06/')
-        # This will NEVER match complete dates like '20/05/25' or '11/07/2025'
+        # Union Bank Rule: Line ends with an open hyphen or slash (e.g., '19-06-' or '19/06/')
         m_date_prefix = re.match(r"^(\d{1,2}[/-]\d{1,2}[/-])\s*(.*)$", line)
 
         if m_date_prefix and not re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", line):
             prefix_date = m_date_prefix.group(1).rstrip("-/")
             top_rest = m_date_prefix.group(2).strip()
 
-            # Look ahead up to 3 lines for the standalone closing year '20XX'
             matched_k = None
             year_val = None
             rest_k = ""

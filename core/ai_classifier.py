@@ -66,9 +66,22 @@ def classify_table_layout_with_llm(sample_text: str, openai_client=None) -> Pars
     # Deterministic Heuristic Fallback
     sample_upper = sample_text.upper()
 
-    # Rule 1: PARSER_D
+    # Rule 1: ICICI / Single Amount Running Balance -> PARSER_A
+    if "STATEMENT OF TRANSACTIONS IN SAVINGS ACCOUNT" in sample_upper or "ICICI" in sample_upper:
+        logger.info("[AI Classifier] Matched ICICI statement format -> PARSER_A.")
+        return ParserDetection(
+            parser="PARSER_A",
+            confidence=0.95,
+            table_type="DATE_DESC_AMT_BAL",
+            debit_credit_method="BALANCE_DIFFERENCE",
+            multiline_transactions=True,
+            layout_required=True,
+            reasoning="ICICI single-amount running balance table detected.",
+        )
+
+    # Rule 2: PARSER_D (Txn No schema)
     if ("TXN NO" in sample_upper or "KIMS" in sample_upper) or re.search(r"\bS\d{7,10}\b", sample_text, re.I):
-        logger.info("[AI Classifier] Heuristic matched PARSER_D (Txn No schema).")
+        logger.info("[AI Classifier] Matched PARSER_D (Txn No schema).")
         return ParserDetection(
             parser="PARSER_D",
             confidence=0.95,
@@ -79,12 +92,12 @@ def classify_table_layout_with_llm(sample_text: str, openai_client=None) -> Pars
             reasoning="Detected transaction IDs / Parser D header markers.",
         )
 
-    # Rule 2: PARSER_C
+    # Rule 3: PARSER_C (Cr/Dr suffix flags on amounts)
     if re.search(r"\d+\.\d{2}\s*\((?:Dr|Cr|DR|CR|DEBIT|CREDIT)\)", sample_text, re.I) or (
         re.search(r"\b(CR|DR|DEBIT|CREDIT)\b", sample_upper)
         and ("INSTRUMENT" in sample_upper or "TYPE" in sample_upper or re.search(r"\d+\.?\d*\s+(?:CR|DR)\s+\d+\.?\d*", sample_text, re.I))
     ):
-        logger.info("[AI Classifier] Heuristic matched PARSER_C (Cr/Dr indicator schema).")
+        logger.info("[AI Classifier] Matched PARSER_C (Cr/Dr indicator schema).")
         return ParserDetection(
             parser="PARSER_C",
             confidence=0.95,
@@ -95,27 +108,27 @@ def classify_table_layout_with_llm(sample_text: str, openai_client=None) -> Pars
             reasoning="Detected explicit CR/DR flags on amount tokens.",
         )
 
-    # Rule 3: PARSER_B
-    if ("WITHDRAWAL" in sample_upper and "DEPOSIT" in sample_upper) or ("DEBIT" in sample_upper and "CREDIT" in sample_upper):
-        logger.info("[AI Classifier] Heuristic matched PARSER_B (Dual Dr/Cr column schema).")
+    # Rule 4: PARSER_B (HDFC multi-column layout)
+    if ("CHQ./REF.NO" in sample_upper and "VALUE DT" in sample_upper) or "CLOSING BALANCE" in sample_upper:
+        logger.info("[AI Classifier] Matched PARSER_B (Dual Dr/Cr column schema).")
         return ParserDetection(
             parser="PARSER_B",
-            confidence=0.85,
+            confidence=0.90,
             table_type="DATE_DESC_DR_CR_BAL",
             debit_credit_method="EXPLICIT_COLUMNS",
             multiline_transactions=False,
             layout_required=True,
-            reasoning="Detected separate Withdrawal and Deposit columns.",
+            reasoning="Detected explicit multi-column Withdrawal and Deposit headers.",
         )
 
     # Default Rule: PARSER_A
-    logger.info("[AI Classifier] Defaulted to PARSER_A (Single amount column fallback).")
+    logger.info("[AI Classifier] Defaulted to PARSER_A.")
     return ParserDetection(
         parser="PARSER_A",
-        confidence=0.60,
+        confidence=0.70,
         table_type="DATE_DESC_AMT_BAL",
         debit_credit_method="BALANCE_DIFFERENCE",
         multiline_transactions=False,
         layout_required=False,
-        reasoning="Default fallback schema.",
+        reasoning="Default fallback single-column schema.",
     )
