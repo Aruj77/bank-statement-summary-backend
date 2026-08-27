@@ -26,16 +26,23 @@ class DecimalEncoder(json.JSONEncoder):
 
 def reassemble_split_lines(text: str) -> str:
     """
-    Reconstructs 3-tier vertically wrapped PDF lines into single unified transaction rows.
-    Handles Union Bank multi-line layouts with split dates, amounts, descriptions, and Cr/Dr flags.
+    Reconstructs wrapped lines while strictly isolating Bank-specific multi-line patterns.
+    Safe for HDFC, ICICI, SBI, and Union Bank.
     """
     if not text:
         return ""
-    print(text)
-    
-    # Pre-clean trailing newlines between amounts and isolated flags
+
+    # Pass 1: Attach wrapped (Cr)/(Dr) flags to amounts: "1000.00 \n (Cr)" -> "1000.00(Cr)"
     text = re.sub(r"([\d,]+\.\d{2})\s*\n\s*\(([CcRrDdEeBbIitT]{2,6})\)", r"\1(\2)", text)
     text = re.sub(r"([\d,]+\.\d{2})\s*\n\s*([Cc][Rr]|[Dd][Rr])\b", r"\1(\2)", text)
+
+    # Pass 2: Attach split balance amounts (e.g. "1005000.00(Cr) \n 1011867.59(Cr)")
+    text = re.sub(
+        r"([\d,]+\.\d{2}\(?(?:Cr|Dr|CR|DR|DEBIT|CREDIT)?\)?)\s*\n\s*([\d,]+\.\d{2}\(?(?:Cr|Dr|CR|DR|DEBIT|CREDIT)?\)?)(?=\s|$|\n)",
+        r"\1 \2",
+        text,
+        flags=re.I,
+    )
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     merged = []
@@ -44,21 +51,22 @@ def reassemble_split_lines(text: str) -> str:
     while i < len(lines):
         line = lines[i]
 
-        # Match start of a split date row (e.g., "19-06-" or "19-06- 1005000.00 1011867.59")
+        # STRICT Union Bank Rule: Line MUST end with an open hyphen or slash (e.g., '19-06-' or '19/06/')
+        # This will NEVER match complete dates like '20/05/25' or '11/07/2025'
         m_date_prefix = re.match(r"^(\d{1,2}[/-]\d{1,2}[/-])\s*(.*)$", line)
 
-        if m_date_prefix:
+        if m_date_prefix and not re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", line):
             prefix_date = m_date_prefix.group(1).rstrip("-/")
             top_rest = m_date_prefix.group(2).strip()
 
-            # Look ahead up to 3 lines for the closing year '20XX'
+            # Look ahead up to 3 lines for the standalone closing year '20XX'
             matched_k = None
             year_val = None
             rest_k = ""
 
             for k in range(1, min(4, len(lines) - i)):
                 next_line = lines[i + k]
-                m_year = re.match(r"^(\d{4})\b\s*(.*)$", next_line)
+                m_year = re.match(r"^(20\d{2})\b\s*(.*)$", next_line)
                 if m_year:
                     matched_k = k
                     year_val = m_year.group(1)
@@ -66,35 +74,20 @@ def reassemble_split_lines(text: str) -> str:
                     break
 
             if matched_k is not None:
-                # Collect all intermediate description body lines
                 body_lines = [lines[i + j] for j in range(1, matched_k)]
                 body_text = " ".join(body_lines).strip()
                 reconstructed_date = f"{prefix_date}-{year_val}"
 
                 top_amts = re.findall(r"[\d,]+\.\d{2}", top_rest)
-                top_flags = re.findall(r"\((?:Cr|Dr|CR|DR|DEBIT|CREDIT)\)", top_rest, re.I)
                 k_flags = re.findall(r"\((?:Cr|Dr|CR|DR|DEBIT|CREDIT)\)", rest_k, re.I)
-                body_amts = re.findall(r"[\d,]+\.\d{2}", body_text)
 
-                # Tier Case 1: Top has 2 amounts, bottom has 2 flags e.g. "(Cr) (Cr)", middle has description
-                # Produces: "19-06-2025 A197230 FRM KCC 5031290 1005000.00(Cr) 1011867.59(Cr)"
-                if len(top_amts) == 2 and not top_flags and len(k_flags) >= 2:
-                    flag1 = k_flags[0]
-                    flag2 = k_flags[1]
-                    merged.append(f"{reconstructed_date} {body_text} {top_amts[0]}{flag1} {top_amts[1]}{flag2}")
-
-                # Tier Case 2: Top has Balance, middle has Txn Amount with flag, bottom has Balance flag "(Cr)"
-                # Produces: "19-06-2025 U3680388 UPIAR/... 2000.00(Dr) 1009867.59(Cr)"
-                elif len(top_amts) == 1 and not top_flags and len(body_amts) >= 1 and len(k_flags) >= 1:
-                    bal_amt = top_amts[0]
-                    bal_flag = k_flags[0]
-                    merged.append(f"{reconstructed_date} {body_text} {bal_amt}{bal_flag}")
-
-                # Tier Case 3: Standard wrap assembly
+                if len(top_amts) == 2 and len(k_flags) >= 2:
+                    merged.append(f"{reconstructed_date} {body_text} {top_amts[0]}{k_flags[0]} {top_amts[1]}{k_flags[1]}")
+                elif len(top_amts) == 1 and len(k_flags) >= 1:
+                    merged.append(f"{reconstructed_date} {body_text} {top_amts[0]}{k_flags[0]}")
                 else:
                     full_row = f"{reconstructed_date} {body_text} {top_rest} {rest_k}".strip()
-                    full_row = re.sub(r"\s+", " ", full_row)
-                    merged.append(full_row)
+                    merged.append(re.sub(r"\s+", " ", full_row))
 
                 i += matched_k + 1
                 continue
@@ -111,38 +104,29 @@ def extract_pdf_contents(file_bytes: bytes, password: str = None) -> Tuple[List[
 
     with pdfplumber.open(io.BytesIO(file_bytes), password=password) as pdf:
         total_pages = len(pdf.pages)
-        logger.info(f"=== [RAW DATA] Starting extraction for {total_pages} pages ===")
-
         for idx, page in enumerate(pdf.pages):
             raw_text = page.extract_text() or ""
             raw_layout_text = page.extract_text(layout=True) or ""
 
-            text = reassemble_split_lines(raw_text)
-            layout_text = reassemble_split_lines(raw_layout_text)
+            pages_text.append(reassemble_split_lines(raw_text))
+            pages_layout.append(reassemble_split_lines(raw_layout_text))
 
-            pages_text.append(text)
-            pages_layout.append(layout_text)
-
+    logger.info(f"[PDF Engine] Extracted {total_pages} pages successfully.")
     return pages_text, pages_layout, total_pages
 
 
 def process_bank_statement(
-    file_bytes: bytes,
-    password: str = None,
-    openai_client=None,
+    file_bytes: bytes, password: str = None, openai_client=None
 ) -> Dict[str, Any]:
     pages_text, pages_layout, total_pages = extract_pdf_contents(file_bytes, password)
-    logger.info(f"[PDF Engine] Loaded {total_pages} pages successfully.")
-
     meta = detect_bank_and_metadata(pages_text)
-    opening_balance = meta.get("openingBalance")
-    closing_balance = meta.get("closingBalance")
+    op_bal = meta.get("openingBalance")
+    cl_bal = meta.get("closingBalance")
 
-    logger.info(f"[Bank Detection] Bank: {meta.get('bank')} | A/C: {meta.get('accountNumber')}")
+    logger.info(f"[Bank Detection] Bank: {meta.get('bank')} | A/C: {meta.get('accountNumber')} | Balances: {op_bal} -> {cl_bal}")
 
     sample_text, is_layout = build_ai_table_sample(pages_text, pages_layout)
     detection = classify_table_layout_with_llm(sample_text, openai_client)
-    logger.info(f"[AI Classifier] Selected: {detection.parser} (Confidence: {detection.confidence})")
 
     candidate_queue = [detection.parser] + [
         pid for pid in PARSER_REGISTRY.keys() if pid != detection.parser
@@ -156,14 +140,13 @@ def process_bank_statement(
             continue
 
         parser_entry = PARSER_REGISTRY[parser_id]
-
         try:
             raw_txns = parser_entry["fn"](pages_text, pages_layout, meta)
-            val_result = validate_and_score_transactions(raw_txns, opening_balance, closing_balance)
+            val_result = validate_and_score_transactions(raw_txns, op_bal, cl_bal)
 
             reconciled = "PASSED" if val_result.details.get("reconciliationVerified") else "FAILED"
             logger.info(
-                f"[Parser Engine] {parser_id:<9} -> {len(raw_txns):>4} txns | Score: {val_result.score:.3f} | Reconciliation: {reconciled}"
+                f"[Parser Engine] {parser_id:<9} -> {len(raw_txns):>4} txns | Score: {val_result.score:.3f} | Reconciliation: {reconciled} (Diff: {val_result.details.get('auditDifference')})"
             )
 
             if val_result.score > highest_score:
@@ -173,17 +156,17 @@ def process_bank_statement(
             if val_result.is_valid and val_result.score >= 0.85:
                 logger.info(f"[Parser Engine] Validation passed on {parser_id}. Halting queue.")
                 break
-
         except Exception as e:
             logger.warning(f"[Parser Engine] {parser_id} failed: {e}")
 
     if not best_result or not best_result[2].is_valid:
-        logger.warning("[FALLBACK] Deterministic parsers failed. Invoking LLM Page Fallback.")
+        logger.warning("[FALLBACK] Parsers failed validation threshold. Invoking LLM Page Fallback.")
         fallback_txns = parse_with_chunked_llm_fallback(pages_text, openai_client)
-        val_result = validate_and_score_transactions(fallback_txns, opening_balance, closing_balance)
+        val_result = validate_and_score_transactions(fallback_txns, op_bal, cl_bal)
         best_result = ("AI_FALLBACK_PARSER", fallback_txns, val_result)
 
     final_parser_id, final_txns, final_val = best_result
+    logger.info(f"[Pipeline Summary] Resolved via {final_parser_id} | Total Rows: {len(final_txns)} | Reconciled: {final_val.details.get('reconciliationVerified')}")
 
     return {
         "status": "success",
